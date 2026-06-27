@@ -21,7 +21,7 @@ An advanced Android application for ecological field research, vegetation analys
 ## Installation
 1. **Clone the repo**: 
    ```bash
-   git clone https://github.com/YOUR_USERNAME/kolia-research-app.git
+   git clone https://github.com/giorgipeikrishvili081-del/kolia-research-app.git
    ```
 2. **Install dependencies**: 
    ```bash
