@@ -116,7 +116,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      'ბუნებრივ-ტერიტორიული კომპლექსი',
+                      'საქართველოს კარტოგრაფთა ასოციაცია',
                       textAlign: TextAlign.center,
                       style: theme.textTheme.bodyMedium?.copyWith(
                         color: colorScheme.onSurfaceVariant,
@@ -139,7 +139,7 @@ class _LoginScreenState extends State<LoginScreen> {
                               ),
                               const SizedBox(height: 8),
                               DropdownButtonFormField<String>(
-                                value: selectedTeam,
+                                initialValue: selectedTeam,
                                 isExpanded: true,
                                 icon: const Icon(Icons.expand_more_rounded),
                                 decoration: InputDecoration(

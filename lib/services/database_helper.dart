@@ -133,41 +133,46 @@ class DatabaseHelper {
       'date': data['თარიღი'] ?? DateTime.now().toString().split('.')[0],
       'data': jsonEncode(data),
       'is_synced': isSynced ? 1 : 0,
+      'is_uploaded': 0, // Reset upload status on edit
     }, where: 'id = ?', whereArgs: [id]);
   }
 
   Future<void> markAsSynced(int id, {String? cloudId}) async {
     final db = await instance.database;
-    if (cloudId != null) {
-      // Also update the JSON data to include the cloud ID
-      final maps = await db.query('forms', where: 'id = ?', whereArgs: [id]);
-      if (maps.isNotEmpty) {
-        final row = maps.first;
-        final dataMap = Map<String, dynamic>.from(jsonDecode(row['data'] as String));
-        dataMap['id'] = cloudId;
-        await db.update('forms', {
-          'is_synced': 1,
-          'data': jsonEncode(dataMap),
-        }, where: 'id = ?', whereArgs: [id]);
-        return;
+    await db.transaction((txn) async {
+      if (cloudId != null) {
+        // Also update the JSON data to include the cloud ID
+        final maps = await txn.query('forms', where: 'id = ?', whereArgs: [id]);
+        if (maps.isNotEmpty) {
+          final row = maps.first;
+          final dataMap = Map<String, dynamic>.from(jsonDecode(row['data'] as String));
+          
+          // If there's a nested 'data' field (standard for this app's forms), 
+          // put the ID inside it so it's picked up by BtkFormPage and sync logic.
+          if (dataMap.containsKey('data') && dataMap['data'] is Map) {
+            final innerData = Map<String, dynamic>.from(dataMap['data']);
+            innerData['id'] = cloudId;
+            dataMap['data'] = innerData;
+          } else {
+            dataMap['id'] = cloudId;
+          }
+
+          await txn.update('forms', {
+            'is_synced': 1,
+            'data': jsonEncode(dataMap),
+          }, where: 'id = ?', whereArgs: [id]);
+          return;
+        }
       }
-    }
-    await db.update('forms', {'is_synced': 1}, where: 'id = ?', whereArgs: [id]);
+      await txn.update('forms', {'is_synced': 1}, where: 'id = ?', whereArgs: [id]);
+    });
   }
 
   Future<Map<String, dynamic>?> getForm(int id) async {
     final db = await instance.database;
     final maps = await db.query('forms', where: 'id = ?', whereArgs: [id]);
     if (maps.isNotEmpty) {
-      final row = maps.first;
-      Map<String, dynamic> dataMap;
-      if (row['data'] != null) {
-        dataMap = Map<String, dynamic>.from(jsonDecode(row['data'] as String));
-      } else {
-        dataMap = <String, dynamic>{};
-      }
-      dataMap['db_id'] = row['id'];
-      return dataMap;
+      return _parseFormRow(maps.first);
     }
     return null;
   }
@@ -175,23 +180,108 @@ class DatabaseHelper {
   Future<List<Map<String, dynamic>>> getAllForms() async {
     final db = await instance.database;
     final result = await db.query('forms', orderBy: 'date DESC');
-    return result.map((row) {
-      Map<String, dynamic> dataMap;
-      if (row['data'] != null) {
-        dataMap = Map<String, dynamic>.from(jsonDecode(row['data'] as String));
-      } else {
-        dataMap = <String, dynamic>{};
-        row.forEach((key, value) => dataMap[key] = value?.toString() ?? '');
+    return result.map((row) => _parseFormRow(row)).toList();
+  }
+
+  Future<List<Map<String, dynamic>>> getUnsyncedForms() async {
+    final db = await instance.database;
+    final result = await db.query('forms', where: 'is_synced = 0');
+    return result.map((row) => _parseFormRow(row)).toList();
+  }
+
+  Future<int> getUnsyncedCount() async {
+    final db = await instance.database;
+    final result = await db.rawQuery('SELECT COUNT(*) FROM forms WHERE is_synced = 0');
+    return Sqflite.firstIntValue(result) ?? 0;
+  }
+
+  Map<String, dynamic> _parseFormRow(Map<String, dynamic> row) {
+    Map<String, dynamic> dataMap;
+    if (row['data'] != null) {
+      dataMap = Map<String, dynamic>.from(jsonDecode(row['data'] as String));
+      // Ensure the row's date is available if the JSON doesn't have it
+      if (!dataMap.containsKey('date') && row['date'] != null) {
+        dataMap['date'] = row['date'];
       }
-      dataMap['db_id'] = row['id'];
-      dataMap['is_synced'] = row['is_synced'] == 1;
-      dataMap['is_uploaded'] = row['is_uploaded'] == 1;
-      return dataMap;
-    }).toList();
+      if (!dataMap.containsKey('თარიღი') && row['date'] != null) {
+        dataMap['თარიღი'] = row['date'];
+      }
+    } else {
+      dataMap = <String, dynamic>{};
+      row.forEach((key, value) => dataMap[key] = value?.toString() ?? '');
+    }
+    dataMap['db_id'] = row['id'];
+    dataMap['is_synced'] = row['is_synced'] == 1;
+    dataMap['is_uploaded'] = row['is_uploaded'] == 1;
+    return dataMap;
+  }
+
+  /// Extracts the actual form data ready for sync from a local database record.
+  /// Handles the nesting used in the app's local storage.
+  static Map<String, dynamic> extractFormData(Map<String, dynamic> localRecord) {
+    if (localRecord['data'] != null && localRecord['data'] is Map) {
+      return Map<String, dynamic>.from(localRecord['data']);
+    }
+    
+    // Fallback/Legacy: cleanup top-level fields
+    final data = Map<String, dynamic>.from(localRecord);
+    data.remove('db_id');
+    data.remove('is_synced');
+    data.remove('is_uploaded');
+    data.remove('data');
+    return data;
   }
 
   Future<void> deleteForm(int id) async {
     final db = await instance.database;
     await db.delete('forms', where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<void> updateAllDatesToCurrent() async {
+    final db = await instance.database;
+    final nowTime = DateTime.now();
+    final now = nowTime.toString().split('.')[0];
+    
+    // Support multiple common formats for better matching in ExportPage
+    final todayStr1 = "${nowTime.year}-${nowTime.month.toString().padLeft(2, '0')}-${nowTime.day.toString().padLeft(2, '0')}";
+    final todayStr2 = "${nowTime.day.toString().padLeft(2, '0')}.${nowTime.month.toString().padLeft(2, '0')}.${nowTime.year}";
+
+    // Update forms
+    final forms = await db.query('forms');
+    for (var form in forms) {
+      final id = form['id'];
+      final dataStr = form['data'] as String?;
+      if (dataStr != null) {
+        final dataMap = Map<String, dynamic>.from(jsonDecode(dataStr));
+        dataMap['date'] = todayStr1;
+        if (dataMap.containsKey('თარიღი')) dataMap['თარიღი'] = todayStr1;
+        
+        await db.update('forms', {
+          'date': now,
+          'data': jsonEncode(dataMap),
+        }, where: 'id = ?', whereArgs: [id]);
+      } else {
+        await db.update('forms', {'date': now}, where: 'id = ?', whereArgs: [id]);
+      }
+    }
+
+    // Update drafts
+    final drafts = await db.query('drafts');
+    for (var draft in drafts) {
+      final id = draft['id'];
+      final dataStr = draft['data'] as String?;
+      if (dataStr != null) {
+        final dataMap = Map<String, dynamic>.from(jsonDecode(dataStr));
+        dataMap['date'] = todayStr1;
+        if (dataMap.containsKey('თარიღი')) dataMap['თარიღი'] = todayStr1;
+        
+        await db.update('drafts', {
+          'date': now,
+          'data': jsonEncode(dataMap),
+        }, where: 'id = ?', whereArgs: [id]);
+      } else {
+        await db.update('drafts', {'date': now}, where: 'id = ?', whereArgs: [id]);
+      }
+    }
   }
 }

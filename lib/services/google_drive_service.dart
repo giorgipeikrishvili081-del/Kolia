@@ -1,5 +1,6 @@
-import 'dart:io';
 import 'dart:convert';
+import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:googleapis/drive/v3.dart' as drive;
 import 'package:http/http.dart' as http;
@@ -10,37 +11,192 @@ import 'package:kolia/services/secrets.dart';
 
 class GoogleDriveService {
   static final GoogleSignIn _googleSignIn = GoogleSignIn(
-    // NOTE: For Drive API to work on Android, you MUST provide the WEB Client ID here
-    // even though this is an Android app.
     serverClientId: AppSecrets.googleDriveClientId,
     scopes: [
       drive.DriveApi.driveFileScope,
+      drive.DriveApi.driveMetadataReadonlyScope,
+      drive.DriveApi.driveReadonlyScope,
     ],
   );
 
-  static Future<GoogleSignInAccount?> signIn() async {
-    // Try to sign in without prompting first
-    var account = await _googleSignIn.signInSilently();
-    // If that fails, show the popup
-    account ??= await _googleSignIn.signIn();
-    return account;
+  static drive.DriveApi? _cachedDriveApi;
+  static String? _cachedUserEmail;
+
+  /// Returns a DriveApi instance using an API Key for public access.
+  static drive.DriveApi _getPublicDriveApi() {
+    return drive.DriveApi(ApiKeyClient(AppSecrets.googleApiKey));
+  }
+
+  static Future<GoogleSignInAccount?> signIn({bool silent = false}) async {
+    // Check current user first to avoid unnecessary async calls
+    if (_googleSignIn.currentUser != null) return _googleSignIn.currentUser;
+    
+    try {
+      var account = await _googleSignIn.signInSilently();
+      if (!silent && account == null) {
+        account = await _googleSignIn.signIn();
+      }
+      return account;
+    } catch (e) {
+      if (!silent) {
+        return await _googleSignIn.signIn();
+      }
+      return null;
+    }
+  }
+
+  static Future<drive.DriveApi> _getDriveApi() async {
+    final account = await signIn();
+    if (account == null) throw Exception('Google Sign-In failed');
+    return _createDriveApi(account);
+  }
+
+  static Future<drive.DriveApi?> _getDriveApiSilently() async {
+    final account = await signIn(silent: true);
+    if (account == null) return null;
+    return _createDriveApi(account);
+  }
+
+  static drive.DriveApi _createDriveApi(GoogleSignInAccount account) {
+    // Reuse DriveApi if the user hasn't changed
+    if (_cachedDriveApi != null && _cachedUserEmail == account.email) {
+      return _cachedDriveApi!;
+    }
+
+    final authenticateClient = GoogleAuthClient(account);
+    _cachedDriveApi = drive.DriveApi(authenticateClient);
+    _cachedUserEmail = account.email;
+    return _cachedDriveApi!;
+  }
+
+  /// Lists files in a specific Google Drive folder
+  static Future<List<drive.File>> listFiles(String folderId, {bool silent = false}) async {
+    final apiKey = AppSecrets.googleApiKey;
+    final isApiKeyConfigured = apiKey != 'YOUR_GOOGLE_API_KEY_HERE' && apiKey.isNotEmpty;
+
+    // 1. Try public access with API Key first
+    if (isApiKeyConfigured) {
+      try {
+        final publicApi = _getPublicDriveApi();
+        debugPrint('GoogleDriveService: Requesting file list for folder: $folderId');
+        
+        // Try to get folder metadata first to verify access
+        try {
+          final folder = await publicApi.files.get(folderId, $fields: 'id, name, capabilities') as drive.File;
+          debugPrint('GoogleDriveService: Folder accessible: ${folder.name}');
+        } catch (e) {
+          debugPrint('GoogleDriveService: Warning - Could not verify folder metadata: $e');
+          // Continue anyway, as list might work even if get folder doesn't
+        }
+
+        final fileList = await publicApi.files.list(
+          q: "'$folderId' in parents and trashed = false",
+          $fields: "files(id, name, size, mimeType), nextPageToken",
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+        );
+        
+        final files = fileList.files ?? [];
+        debugPrint('GoogleDriveService: API Key request successful. Found ${files.length} files.');
+        
+        // Debug: log first few file names if any
+        if (files.isNotEmpty) {
+          debugPrint('GoogleDriveService: First file: ${files.first.name}');
+        }
+        
+        return files;
+      } catch (e) {
+        debugPrint('GoogleDriveService: API Key Error: $e');
+        if (!silent) {
+          String errorMsg = e.toString();
+          if (errorMsg.contains('403')) {
+            errorMsg = 'წვდომა შეზღუდულია (403). შეამოწმეთ API Key-ს შეზღუდვები და საქაღალდის პარამეტრები.';
+          }
+          throw Exception(errorMsg);
+        }
+      }
+    }
+
+    // 2. Fallback to Authenticated access only if user explicitly asks (via silent=false) 
+    // and API key is missing or failed.
+    if (!isApiKeyConfigured || !silent) {
+      debugPrint('GoogleDriveService: Attempting authenticated access fallback...');
+      final driveApi = await _getDriveApiSilently();
+      if (driveApi == null) {
+        if (!silent) throw Exception('Google Drive-ზე წვდომისთვის საჭიროა ავტორიზაცია ან სწორი API Key.');
+        return [];
+      }
+
+      final fileList = await driveApi.files.list(
+        q: "'$folderId' in parents and trashed = false",
+        $fields: "files(id, name, size, mimeType)",
+      );
+
+      return fileList.files ?? [];
+    }
+    
+    return [];
+  }
+
+  /// Downloads a file from Google Drive and saves it to a local file
+  static Future<void> downloadFile(String fileId, File localFile, {Function(double)? onProgress}) async {
+    // 1. Try public access with API Key first
+    final apiKey = AppSecrets.googleApiKey;
+    final isApiKeyConfigured = apiKey != 'YOUR_GOOGLE_API_KEY_HERE' && apiKey.isNotEmpty;
+
+    if (isApiKeyConfigured) {
+      try {
+        final publicApi = _getPublicDriveApi();
+        final drive.Media media = await publicApi.files.get(
+          fileId,
+          downloadOptions: drive.DownloadOptions.fullMedia,
+        ) as drive.Media;
+        
+        await _streamDownload(media, localFile, onProgress);
+        return;
+      } catch (e) {
+        debugPrint('Public download failed: $e. Falling back to authenticated download.');
+      }
+    }
+
+    // 2. Fallback to Authenticated access
+    final driveApi = await _getDriveApi();
+    final drive.Media media = await driveApi.files.get(
+      fileId,
+      downloadOptions: drive.DownloadOptions.fullMedia,
+    ) as drive.Media;
+    await _streamDownload(media, localFile, onProgress);
+  }
+
+  static Future<void> _streamDownload(drive.Media media, File localFile, Function(double)? onProgress) async {
+    List<int> dataStore = [];
+    int downloaded = 0;
+    final int? total = media.length;
+
+    await for (final data in media.stream) {
+      dataStore.addAll(data);
+      downloaded += data.length;
+      if (onProgress != null && total != null) {
+        onProgress(downloaded / total);
+      }
+    }
+
+    await localFile.writeAsBytes(dataStore);
   }
 
   static Future<void> uploadAsGoogleDoc({
     required String title,
     required String htmlContent,
+    String? parentFolderId,
   }) async {
-    final GoogleSignInAccount? account = await _googleSignIn.signIn();
-    if (account == null) throw Exception('Google Sign-In failed or cancelled');
-
-    final authHeaders = await account.authHeaders;
-    final authenticateClient = GoogleAuthClient(authHeaders);
-    final driveApi = drive.DriveApi(authenticateClient);
+    final driveApi = await _getDriveApi();
 
     final driveFile = drive.File();
     driveFile.name = title;
-    // Specify the target MIME type as Google Docs
     driveFile.mimeType = 'application/vnd.google-apps.document';
+    if (parentFolderId != null) {
+      driveFile.parents = [parentFolderId];
+    }
 
     final bytes = utf8.encode(htmlContent);
     final media = drive.Media(
@@ -55,16 +211,44 @@ class GoogleDriveService {
     );
   }
 
-  static Future<void> uploadFormAsGoogleDoc(Map<String, dynamic> rawData) async {
-    // Sanitize data for JSON encoding (handle Timestamps and other non-encodable types)
+  /// Uploads multiple forms to Google Drive in parallel.
+  /// Returns a map with success and fail counts.
+  static Future<Map<String, int>> uploadMultipleForms(
+    List<Map<String, dynamic>> forms, {
+    String? parentFolderId,
+    Function(int completed, int total)? onProgress,
+  }) async {
+    int successCount = 0;
+    int failCount = 0;
+    int completedCount = 0;
+
+    if (forms.isEmpty) return {'success': 0, 'fail': 0};
+
+    // Limit concurrency to avoid hitting Drive API rate limits too hard
+    // but keep it "all together" in parallel batches.
+    final List<Future<void>> tasks = forms.map((form) async {
+      try {
+        await uploadFormAsGoogleDoc(form, parentFolderId: parentFolderId);
+        successCount++;
+      } catch (e) {
+        debugPrint('Bulk upload error: $e');
+        failCount++;
+      } finally {
+        completedCount++;
+        if (onProgress != null) {
+          onProgress(completedCount, forms.length);
+        }
+      }
+    }).toList();
+
+    await Future.wait(tasks);
+    return {'success': successCount, 'fail': failCount};
+  }
+
+  static Future<void> uploadFormAsGoogleDoc(Map<String, dynamic> rawData, {String? parentFolderId}) async {
     final Map<String, dynamic> data = json.decode(json.encode(rawData, toEncodable: (item) {
-      if (item is Timestamp) {
-        return item.toDate().toIso8601String();
-      }
-      if (item is DateTime) {
-        return item.toIso8601String();
-      }
-      // Return a string representation for anything else JSON doesn't know
+      if (item is Timestamp) return item.toDate().toIso8601String();
+      if (item is DateTime) return item.toIso8601String();
       return item.toString();
     }));
 
@@ -75,34 +259,43 @@ class GoogleDriveService {
         ? 'ბტკ ბლანკი - $btkId (${data['date'] ?? ''})'
         : 'ბტკ ბლანკი (${data['date'] ?? ''})';
 
-    await uploadAsGoogleDoc(title: title, htmlContent: htmlContent);
+    await uploadAsGoogleDoc(
+      title: title, 
+      htmlContent: htmlContent,
+      parentFolderId: parentFolderId,
+    );
 
-    // Mark as uploaded in Firebase
-    if (rawData['id'] != null) {
-      await FirebaseService.markAsUploadedToDrive(rawData['id']);
+    // Defensive updates to Firestore/SQLite - don't let these fail the whole operation
+    // if the Drive upload was already successful.
+    try {
+      if (rawData['id'] != null) {
+        await FirebaseService.markAsUploadedToDrive(rawData['id']);
+      }
+      
+      if (rawData['db_id'] != null) {
+        await DatabaseHelper.instance.markAsUploaded(rawData['db_id']);
+      }
+    } catch (e) {
+      debugPrint('GoogleDriveService: Metadata update failed after successful upload: $e');
     }
   }
 
   static String generateHtmlContent(Map<String, dynamic> data) {
     final StringBuffer html = StringBuffer();
-    
-    // Get team color from data, fallback to a dark blue-grey if not found
-    String primaryColor = '#2c3e50'; // Default
+    String primaryColor = '#2c3e50';
     if (data['team_color'] != null) {
       try {
         final int colorValue = data['team_color'] is int 
             ? data['team_color'] 
             : int.parse(data['team_color'].toString());
-        // Convert ARGB int to hex string #RRGGBB
         primaryColor = '#${(colorValue & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
-      } catch (e) {
-        // Fallback on error
-      }
+      } catch (e) {}
     }
 
     html.write('<!DOCTYPE html><html><head><meta charset="utf-8">');
     html.write('<style>');
     html.write('body { font-family: "DejaVu Sans", "Helvetica", Arial, sans-serif; line-height: 1.5; color: #333; margin: 0; padding: 20px; }');
+    html.write('sup { font-size: 0.75em; line-height: 0; position: relative; vertical-align: baseline; top: -0.5em; }');
     html.write('.header { text-align: center; border-bottom: 3px solid $primaryColor; padding-bottom: 15px; margin-bottom: 25px; page-break-after: avoid; break-after: avoid; }');
     html.write('h1 { font-size: 22px; color: $primaryColor; margin: 0; }');
     html.write('.team-badge { display: inline-block; padding: 4px 12px; background-color: $primaryColor; color: white; border-radius: 20px; font-size: 12px; margin-top: 8px; font-weight: bold; }');
@@ -162,7 +355,6 @@ class GoogleDriveService {
     _addInfoRow(html, 'მცენარეული ასოციაციის დასახელება', data['plant_association']);
     html.write('</table>');
 
-    // Vegetation Table
     if (data['vegetation_rows'] != null && (data['vegetation_rows'] as List).isNotEmpty) {
       html.write('<div class="section-header">III. მცენარეულობის სახეობრივი შემადგენლობა</div>');
       html.write('<table class="data-table">');
@@ -180,7 +372,6 @@ class GoogleDriveService {
       html.write('</tbody></table>');
     }
 
-    // Soil Table
     if (data['soil_rows'] != null && (data['soil_rows'] as List).isNotEmpty) {
       html.write('<div class="section-header">IV. ნიადაგის პროფილის მორფოლოგიური დახასიათება</div>');
       html.write('<table class="data-table">');
@@ -188,7 +379,9 @@ class GoogleDriveService {
       html.write('<tbody>');
       for (var row in (data['soil_rows'] as List)) {
         html.write('<tr>');
-        html.write('<td class="text-left">${row['genetic_horizon'] ?? ''}</td>');
+        String geneticHorizon = row['genetic_horizon'] ?? '';
+        geneticHorizon = _convertSuperscriptsToHtml(geneticHorizon);
+        html.write('<td class="text-left">$geneticHorizon</td>');
         html.write('<td class="text-left">${row['detailed_description'] ?? ''}</td>');
         html.write('<td class="text-left">${row['geohorizon_index'] ?? ''}</td>');
         html.write('</tr>');
@@ -208,7 +401,6 @@ class GoogleDriveService {
       html.write('</div>');
     }
 
-    // Biomass Table (Page 4)
     if (data['biomass_rows'] != null) {
       html.write('<div class="section-header">V. გეომასების კვლევა</div>');
       html.write('<p style="font-size: 12px; color: #666; margin-bottom: 10px; margin-top: 5px;">ბტკ-ის ვერტიკალური პროფილის მიწისზედა ნაწილის გეომასები</p>');
@@ -231,7 +423,6 @@ class GoogleDriveService {
       html.write('<tbody>');
       
       List rows = data['biomass_rows'] as List;
-      // If no rows or all rows are empty, show at least 5 empty rows
       if (rows.isEmpty || rows.every((r) => (r as Map).values.every((v) => v == null || v.toString().trim().isEmpty))) {
         for (int i = 0; i < 5; i++) {
           html.write('<tr><td>&nbsp;</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>');
@@ -257,7 +448,6 @@ class GoogleDriveService {
       html.write('</tbody></table>');
     }
 
-    // Tree Taxation (Requested to be right after Biomass Study)
     if (data['tree_taxation_rows'] != null && (data['tree_taxation_rows'] as List).isNotEmpty) {
       html.write('<div class="section-header">VI. მცენარეულობის ტაქსაცია</div>');
       html.write('<table class="data-table">');
@@ -265,7 +455,6 @@ class GoogleDriveService {
       html.write('<tbody>');
       int treeIdx = 1;
       for (var row in (data['tree_taxation_rows'] as List)) {
-        // Skip completely empty rows
         if ((row['species']?.isEmpty ?? true) && (row['d']?.isEmpty ?? true) && (row['h']?.isEmpty ?? true) && (row['k2']?.isEmpty ?? true) && (row['volume']?.isEmpty ?? true)) {
           continue;
         }
@@ -282,14 +471,12 @@ class GoogleDriveService {
       html.write('</tbody></table>');
     }
 
-    // Plot Size (Requested to be below Vegetation Taxation)
     if (data['taxation_plot_size'] != null && data['taxation_plot_size'].toString().isNotEmpty) {
       html.write('<div class="highlight-box">');
       html.write('<strong>ნაკვეთის ზომა</strong> ${data['taxation_plot_size']}');
       html.write('</div>');
     }
 
-    // Tree Phytomass Table (Page 6)
     if (data['tree_phytomass_rows'] != null) {
       html.write('<div class="section-header">VII. ხე მცენარეების ფიტომასა</div>');
       html.write('<table class="data-table">');
@@ -299,7 +486,7 @@ class GoogleDriveService {
       html.write('<th colspan="3" style="border: 2px solid #2c3e50;">მმოც. წონა ტ/მ³</th>');
       html.write('<th colspan="5" style="border: 2px solid #2c3e50;">სველი ფიტომასა</th>');
       html.write('<th colspan="5" style="border: 2px solid #2c3e50;">მშრალი ფიტომასა</th>');
-      html.write('<th rowspan="2" style="border: 2px solid #2c3e50;"></th>'); // Empty header for symmetry if needed
+      html.write('<th rowspan="2" style="border: 2px solid #2c3e50;"></th>');
       html.write('</tr>');
       html.write('<tr class="sub-header" style="border: 2px solid #2c3e50;">');
       html.write('<th style="border: 2px solid #2c3e50;">მმოც.</th><th style="border: 2px solid #2c3e50;">სველი</th><th style="border: 2px solid #2c3e50;">მშრალი</th>');
@@ -310,16 +497,16 @@ class GoogleDriveService {
       html.write('<tbody>');
       
       List rows = data['tree_phytomass_rows'] as List;
-      // Filter out actually empty rows
       List activeRows = rows.where((row) => 
         !((row['species']?.isEmpty ?? true) && (row['v_vol']?.isEmpty ?? true) && (row['w_total']?.isEmpty ?? true))
       ).toList();
 
       if (activeRows.isEmpty) {
-        // If all rows are empty, show 5 empty rows
         for (int i = 0; i < 5; i++) {
           html.write('<tr>');
-          for (int j = 0; j < 15; j++) html.write('<td>&nbsp;</td>');
+          for (int j = 0; j < 15; j++) {
+            html.write('<td>&nbsp;</td>');
+          }
           html.write('</tr>');
         }
       } else {
@@ -346,50 +533,43 @@ class GoogleDriveService {
       html.write('</tbody></table>');
     }
 
-    // Vertical Structure Sketch
     final hasSketch = data['sketch_url'] != null || data['sketch_base64'] != null;
     if (hasSketch) {
       html.write('<div class="section-header">VIII. ვერტიკალური სტრუქტურა</div>');
       html.write('<div class="sketch-box">');
-      
-      // Title Bar
       String sTitle = data['sketch_title'] ?? "ვერტიკალური სტრუქტურის სქემა";
       html.write('<div class="sketch-title-bar">$sTitle</div>');
-      
-      // Meta Bar (Index / Height)
       String index = data['sketch_index'] ?? "";
       String height = data['sketch_height'] ?? "";
-      
-      // Clean up potential redundant labels from the data
       String displayIndex = index.replaceAll(RegExp(r'^ინდექსი:\s*', caseSensitive: false), '').trim();
       String displayHeight = height.replaceAll(RegExp(r'^სიმაღლე:\s*', caseSensitive: false), '').trim();
+      if (displayHeight.isEmpty) {
+        displayHeight = height.replaceAll(RegExp(r'^სიმაღლითი გრადაცია:\s*', caseSensitive: false), '').trim();
+      }
 
       if (displayIndex.isNotEmpty || displayHeight.isNotEmpty) {
         html.write('<div class="sketch-meta-bar">');
         if (displayIndex.isNotEmpty) html.write('<strong>ინდექსი:</strong> $displayIndex &nbsp;&nbsp;&bull;&nbsp;&nbsp; ');
-        if (displayHeight.isNotEmpty) html.write('<strong>სიმაღლე:</strong> $displayHeight');
+        if (displayHeight.isNotEmpty) html.write('<strong>სიმაღლითი გრადაცია:</strong> $displayHeight');
         html.write('</div>');
       }
       
-      // Image Content
       html.write('<div class="sketch-img-container">');
       if (data['sketch_url'] != null) {
-        // Use Cloud URL if available
         html.write('<img src="${data['sketch_url']}">');
       } else {
-        // Fallback to local Base64
         html.write('<img src="data:image/png;base64,${data['sketch_base64']}">');
       }
       html.write('</div>');
       
-      // Note/Footer
       String above = data['sketch_above_ground'] ?? "";
       String below = data['sketch_below_ground'] ?? "";
+      String totalHeight = data['sketch_total_height'] ?? "";
 
-      if (height.isNotEmpty || above.isNotEmpty || below.isNotEmpty) {
+      if (totalHeight.isNotEmpty || above.isNotEmpty || below.isNotEmpty) {
         html.write('<div class="sketch-note">');
         html.write('<strong>ვერტიკალური პროფილის მიწისზედა ნაწილის დამოკიდებულება მიწისქვედა ნაწილთან.</strong><br/>');
-        if (height.isNotEmpty) html.write('სიმაღლე: $height &nbsp;&nbsp;');
+        if (totalHeight.isNotEmpty) html.write('ჯამური სიმაღლე: $totalHeight &nbsp;&nbsp;');
         if (above.isNotEmpty) html.write('მიწისზედა: $above &nbsp;&nbsp;');
         if (below.isNotEmpty) html.write('მიწისქვედა: $below &nbsp;&nbsp;');
         html.write('</div>');
@@ -406,17 +586,108 @@ class GoogleDriveService {
     html.write('<tr><td class="label">$label:</td><td class="value">${value ?? ""}</td></tr>');
   }
 
+  static String _convertSuperscriptsToHtml(String input) {
+    if (input.isEmpty) return input;
+    
+    // Map of Unicode superscript characters to their normal counterparts
+    final Map<String, String> superscriptToNormal = {
+      '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
+      'ᵃ': 'a', 'ᵇ': 'b', 'ᶜ': 'c', 'ᵈ': 'd', 'ᵉ': 'e', 'ᶠ': 'f', 'ᵍ': 'g', 'ʰ': 'h', 'ⁱ': 'i', 'ʲ': 'j',
+      'ᵏ': 'k', 'ˡ': 'l', 'ᵐ': 'm', 'ⁿ': 'n', 'ᵒ': 'o', 'ᵖ': 'p', 'ʳ': 'r', 'ˢ': 's', 'ᵗ': 't', 'ᵘ': 'u',
+      'ᵛ': 'v', 'ʷ': 'w', 'ˣ': 'x', 'y': 'y', 'ᶻ': 'z',
+      'ᴬ': 'A', 'ᴮ': 'B', 'ᴰ': 'D', 'ᴱ': 'E', 'ᴳ': 'G', 'ᴴ': 'H', 'ᴵ': 'I', 'ᴶ': 'J', 'ᴷ': 'K', 'ᴸ': 'L',
+      'ᴹ': 'M', 'ᴺ': 'N', 'ᴼ': 'O', 'ᴾ': 'P', 'ᴿ': 'R', 'ᵀ': 'T', 'ᵁ': 'U', 'ⱽ': 'V', 'ᵂ': 'W',
+      '⁺': '+', '⁻': '-', '⁼': '=', '⁽': '(', '⁾': ')', '˙': '.', '’': ',',
+    };
+
+    StringBuffer result = StringBuffer();
+    bool inSup = false;
+
+    for (int i = 0; i < input.length; i++) {
+      String char = input[i];
+      if (superscriptToNormal.containsKey(char)) {
+        if (!inSup) {
+          result.write('<sup>');
+          inSup = true;
+        }
+        result.write(superscriptToNormal[char]);
+      } else {
+        if (inSup) {
+          result.write('</sup>');
+          inSup = false;
+        }
+        result.write(char);
+      }
+    }
+    
+    if (inSup) {
+      result.write('</sup>');
+    }
+
+    return result.toString();
+  }
+
 }
 
 class GoogleAuthClient extends http.BaseClient {
-  final Map<String, String> _headers;
+  final GoogleSignInAccount _account;
   final http.Client _client = http.Client();
 
-  GoogleAuthClient(this._headers);
+  GoogleAuthClient(this._account);
 
   @override
-  Future<http.StreamedResponse> send(http.BaseRequest request) {
-    request.headers.addAll(_headers);
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final authHeaders = await _account.authHeaders;
+    request.headers.addAll(authHeaders);
     return _client.send(request);
+  }
+}
+
+class ApiKeyClient extends http.BaseClient {
+  final String apiKey;
+  final http.Client _client = http.Client();
+
+  ApiKeyClient(this.apiKey);
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final uri = request.url.replace(
+      queryParameters: Map.from(request.url.queryParameters)..putIfAbsent('key', () => apiKey),
+    );
+    
+    debugPrint('ApiKeyClient: [${request.method}] ${uri.host}${uri.path}');
+
+    // We must create a new request because the URL is final in BaseRequest
+    final http.StreamedResponse response;
+    
+    // Create new request
+    final newRequest = http.StreamedRequest(request.method, uri);
+    newRequest.headers.addAll(request.headers);
+    newRequest.headers.remove('Authorization');
+    
+    newRequest.contentLength = request.contentLength;
+    newRequest.followRedirects = request.followRedirects;
+    newRequest.maxRedirects = request.maxRedirects;
+    newRequest.persistentConnection = request.persistentConnection;
+
+    // Pipe the body
+    request.finalize().listen(
+      newRequest.sink.add,
+      onError: newRequest.sink.addError,
+      onDone: newRequest.sink.close,
+      cancelOnError: true,
+    );
+
+    response = await _client.send(newRequest);
+    
+    if (response.statusCode != 200) {
+      // Consume stream to get error message
+      final body = await response.stream.bytesToString();
+      debugPrint('Google API Request Failed: ${response.statusCode} $body');
+      // Re-throw with body info
+      throw Exception('Google API Error (${response.statusCode}): $body');
+    }
+    
+    return response;
   }
 }

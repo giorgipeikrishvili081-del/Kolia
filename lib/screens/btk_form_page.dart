@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:kolia/services/form_data_store.dart';
 import 'package:kolia/services/database_helper.dart';
 import 'package:kolia/screens/map_picker_page.dart';
 import 'package:kolia/screens/plant_id_page.dart';
@@ -8,7 +7,6 @@ import 'package:kolia/services/firebase_service.dart';
 import 'package:kolia/services/auth_service.dart';
 import 'dart:convert';
 import 'dart:ui' as ui;
-import 'dart:typed_data';
 
 class BtkFormPage extends StatefulWidget {
   final int? draftId;
@@ -52,6 +50,7 @@ class _BtkFormPageState extends State<BtkFormPage> {
   final _sketchTitleController = TextEditingController();
   final _sketchIndexController = TextEditingController();
   final _sketchHeightController = TextEditingController();
+  final _sketchTotalHeightController = TextEditingController();
   final _sketchAboveGroundController = TextEditingController();
   final _sketchBelowGroundController = TextEditingController();
   final _sketchFooterController = TextEditingController();
@@ -101,6 +100,12 @@ class _BtkFormPageState extends State<BtkFormPage> {
     _currentDraftId = widget.draftId;
     _currentFormId = widget.formId;
     
+    // Set default date for new forms immediately
+    if (_currentFormId == null && _currentDraftId == null && widget.cloudData == null) {
+      final now = DateTime.now();
+      _dateController.text = "${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}";
+    }
+    
     _initData();
     
     // Ensure # is always present at the start of Landscape Genus Number
@@ -129,6 +134,7 @@ class _BtkFormPageState extends State<BtkFormPage> {
       _sketchTitleController,
       _sketchIndexController,
       _sketchHeightController,
+      _sketchTotalHeightController,
       _sketchFooterController,
       _taxationPlotSizeController
     ];
@@ -200,6 +206,19 @@ class _BtkFormPageState extends State<BtkFormPage> {
       _faciesNameController.text = data['facies_name'] ?? '';
       _steksiController.text = data['steksi'] ?? '';
       _researcherController.text = data['researcher'] ?? '';
+      
+      // If date is missing in data, use today's date
+      final String? savedDate = data['date'];
+      if (savedDate == null || savedDate.isEmpty) {
+        final now = DateTime.now();
+        _dateController.text = "${now.day.toString().padLeft(2, '0')}.${now.month.toString().padLeft(2, '0')}.${now.year}";
+      } else {
+        _dateController.text = savedDate;
+      }
+      
+      _locationController.text = data['location'] ?? '';
+      _steksiController.text = data['steksi'] ?? '';
+      _researcherController.text = data['researcher'] ?? '';
       _dateController.text = data['date'] ?? '';
       _locationController.text = data['location'] ?? '';
       _coordsController.text = data['coords'] ?? '';
@@ -227,6 +246,10 @@ class _BtkFormPageState extends State<BtkFormPage> {
       String height = data['sketch_height'] ?? '';
       if (height == 'სიმაღლე:') height = '';
       _sketchHeightController.text = height;
+
+      String totalHeight = data['sketch_total_height'] ?? '';
+      if (totalHeight == 'ჯამური სიმაღლე:') totalHeight = '';
+      _sketchTotalHeightController.text = totalHeight;
 
       _sketchAboveGroundController.text = data['sketch_above_ground'] ?? '';
       _sketchBelowGroundController.text = data['sketch_below_ground'] ?? '';
@@ -371,7 +394,7 @@ class _BtkFormPageState extends State<BtkFormPage> {
     );
     if (picked != null) {
       setState(() {
-        _dateController.text = picked.toString().split(' ')[0];
+        _dateController.text = "${picked.year}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}";
       });
       _autoSaveDraft();
     }
@@ -440,6 +463,7 @@ class _BtkFormPageState extends State<BtkFormPage> {
         'sketch_title': _sketchTitleController.text,
         'sketch_index': _sketchIndexController.text,
         'sketch_height': _sketchHeightController.text,
+        'sketch_total_height': _sketchTotalHeightController.text,
         'sketch_above_ground': _sketchAboveGroundController.text,
         'sketch_below_ground': _sketchBelowGroundController.text,
         'sketch_footer': _sketchFooterController.text,
@@ -502,7 +526,7 @@ class _BtkFormPageState extends State<BtkFormPage> {
             _cloudId = null;
             localRecord['data'] = Map<String, dynamic>.from(data);
 
-            dbId = await FormDataStore.addForm(localRecord);
+            dbId = await DatabaseHelper.instance.insertForm(localRecord);
             // After creating a copy, we treat it as a new form for the rest of the session
             _currentFormId = dbId; 
           } else {
@@ -511,21 +535,19 @@ class _BtkFormPageState extends State<BtkFormPage> {
               dbId = _currentFormId!;
             } else {
               // It was a cloud form without a local ID yet
-              dbId = await FormDataStore.addForm(localRecord);
+              dbId = await DatabaseHelper.instance.insertForm(localRecord);
               _currentFormId = dbId;
             }
           }
         } else {
-          dbId = await FormDataStore.addForm(localRecord);
+          dbId = await DatabaseHelper.instance.insertForm(localRecord);
           _currentFormId = dbId;
         }
 
         // 2. Attempt to sync to Firebase
-        bool syncSuccess = false;
         try {
           final cloudId = await FirebaseService.saveForm(data, localDbId: dbId);
           _cloudId = cloudId;
-          syncSuccess = true;
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text('ბლანკი სინქრონიზებულია ღრუბელთან!'), backgroundColor: Colors.green),
@@ -1736,10 +1758,10 @@ class _BtkFormPageState extends State<BtkFormPage> {
           hintText: 'ინდექსი:'
         ),
         _buildField(
-          'სიმაღლე:', 
+          'სიმაღლითი გრადაცია:', 
           _sketchHeightController, 
           readOnly: widget.readOnly,
-          hintText: 'სიმაღლე:'
+          hintText: 'სიმაღლითი გრადაცია:'
         ),
         
         const Text(
@@ -1789,10 +1811,10 @@ class _BtkFormPageState extends State<BtkFormPage> {
         ),
         const SizedBox(height: 8),
         _buildField(
-          'სიმაღლე:', 
-          _sketchHeightController, 
+          'ჯამური სიმაღლე:', 
+          _sketchTotalHeightController,
           readOnly: widget.readOnly,
-          hintText: 'სიმაღლე:'
+          hintText: 'ჯამური სიმაღლე:'
         ),
         _buildField(
           'მიწისზედა:', 

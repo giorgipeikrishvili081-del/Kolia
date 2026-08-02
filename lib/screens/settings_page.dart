@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:kolia/screens/map_management_page.dart';
 import 'package:kolia/services/database_helper.dart';
 import 'package:kolia/services/auth_service.dart';
 import 'package:kolia/services/firebase_service.dart';
 import 'package:kolia/services/google_drive_service.dart';
-import 'package:kolia/services/form_data_store.dart';
 import 'package:kolia/services/theme_manager.dart';
 import 'package:kolia/services/app_state.dart';
-import 'package:kolia/main.dart';
+import 'package:kolia/services/shorebird_service.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
@@ -101,8 +102,9 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _syncAllToDrive() async {
     setState(() => _isSyncing = true);
     try {
-      final local = await FormDataStore.savedForms;
+      final local = await DatabaseHelper.instance.getAllForms();
       final cloudForms = await FirebaseService.getAllForms();
+      if (!mounted) return;
       
       final Map<String, Map<String, dynamic>> combinedMap = {};
       for (var f in cloudForms) {
@@ -112,9 +114,24 @@ class _SettingsPageState extends State<SettingsPage> {
       for (var f in local) {
         final dbId = f['db_id'];
         if (dbId == null) continue;
+
+        // Extract cloud ID if it exists
+        final String? cloudIdInLocal = f['id'] ?? (f['data'] is Map ? f['data']['id'] : null);
+
+        if (cloudIdInLocal != null) {
+          if (combinedMap.containsKey(cloudIdInLocal)) {
+            // Already in cloud, update the cloud entry with local DB ID
+            combinedMap[cloudIdInLocal]!['db_id'] = dbId;
+            continue;
+          } else if (f['is_synced'] == true) {
+            // It was synced but is no longer in cloud (deleted from cloud).
+            continue;
+          }
+        }
+
         final key = 'local_$dbId';
         combinedMap[key] = {
-          ...(f['data'] is Map ? f['data'] : (f as Map<String, dynamic>)),
+          ...(f['data'] is Map ? f['data'] : f),
           'db_id': dbId,
           'source': 'local',
         };
@@ -149,9 +166,10 @@ class _SettingsPageState extends State<SettingsPage> {
       }
 
       int successCount = 0;
+      final String? uploadFolderId = await FirebaseService.getUploadFolderId();
       for (var form in formsToProcess) {
         try {
-          await GoogleDriveService.uploadFormAsGoogleDoc(form);
+          await GoogleDriveService.uploadFormAsGoogleDoc(form, parentFolderId: uploadFolderId);
           successCount++;
         } catch (e) {
           debugPrint('Drive upload error: $e');
@@ -401,7 +419,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     ),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.black.withOpacity(0.1),
+                        color: Colors.black.withValues(alpha: 0.1),
                         blurRadius: 4,
                         offset: const Offset(0, 2),
                       ),
@@ -559,6 +577,17 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 24),
           _buildSectionHeader('მონაცემების მართვა'),
           _buildSettingTile(
+            icon: Icons.map_outlined,
+            title: 'რუკების მართვა',
+            subtitle: 'PDF და JPG რუკების გადმოწერა',
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const MapManagementPage()),
+              );
+            },
+          ),
+          _buildSettingTile(
             icon: Icons.storage_rounded,
             title: 'ლოკალური ქეშის გასუფთავება',
             subtitle: 'დროებითი მონაცემების წაშლა',
@@ -621,12 +650,65 @@ class _SettingsPageState extends State<SettingsPage> {
               );
             },
           ),
+          if (_currentTeam?.isAdmin == true) ...[
+            const SizedBox(height: 24),
+            _buildSectionHeader('Admin Debug'),
+            _buildSettingTile(
+              icon: Icons.folder_special_rounded,
+              title: 'Firestore Config',
+              subtitle: 'Folder IDs and Settings',
+              onTap: () async {
+                final config = await FirebaseService.getAppConfig();
+                if (!mounted) return;
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Firestore Config'),
+                    content: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Map Folder ID:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                        SelectableText(config['map_folder_id']?.toString() ?? 'Not Set'),
+                        const SizedBox(height: 12),
+                        const Text('Upload Folder ID:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                        SelectableText(config['upload_folder_id']?.toString() ?? 'Not Set'),
+                        const SizedBox(height: 12),
+                        const Text('PlantID API Key:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                        SelectableText(config['plant_id_api_key']?.toString() ?? 'Not Set'),
+                      ],
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(context), child: const Text('დახურვა')),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ],
           const SizedBox(height: 24),
           _buildSectionHeader('შესახებ'),
-          _buildSettingTile(
-            icon: Icons.info_outline_rounded,
-            title: 'აპლიკაციის ვერსია',
-            subtitle: 'v1.4',
+          FutureBuilder<List<dynamic>>(
+            future: Future.wait([
+              PackageInfo.fromPlatform(),
+              ShorebirdService.instance.getCurrentPatch(),
+            ]),
+            builder: (context, snapshot) {
+              if (!snapshot.hasData) {
+                return _buildSettingTile(
+                  icon: Icons.info_outline_rounded,
+                  title: 'აპლიკაციის ვერსია',
+                  subtitle: 'იტვირთება...',
+                );
+              }
+              final packageInfo = snapshot.data![0] as PackageInfo;
+              final patchNum = snapshot.data![1] as int?;
+              return _buildSettingTile(
+                icon: Icons.info_outline_rounded,
+                title: 'აპლიკაციის ვერსია',
+                subtitle: 'v${packageInfo.version}+${packageInfo.buildNumber}${patchNum != null ? ' (Patch $patchNum)' : ''}',
+              );
+            },
           ),
           const SizedBox(height: 32),
           TextButton(

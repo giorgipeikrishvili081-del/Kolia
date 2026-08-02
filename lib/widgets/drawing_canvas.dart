@@ -117,7 +117,7 @@ class DrawingCanvasState extends State<DrawingCanvas> {
           decoration: BoxDecoration(
             color: const Color(0xFF252525),
             borderRadius: BorderRadius.circular(20),
-            boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 10)],
+            boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.4), blurRadius: 10)],
           ),
           child: Column(
             children: [
@@ -195,7 +195,7 @@ class DrawingCanvasState extends State<DrawingCanvas> {
   }
 
   Widget _buildColorPicker(Color color) {
-    bool isSelected = !isEraser && selectedColor.value == color.value;
+    bool isSelected = !isEraser && selectedColor.toARGB32() == color.toARGB32();
     return GestureDetector(
       onTap: () => setState(() { selectedColor = color; isEraser = false; }),
       child: Container(
@@ -207,7 +207,7 @@ class DrawingCanvasState extends State<DrawingCanvas> {
   }
 
   Widget _buildSpectrumButton() {
-    bool isCustom = !isEraser && !presets.any((c) => c.value == selectedColor.value);
+    bool isCustom = !isEraser && !presets.any((c) => c.toARGB32() == selectedColor.toARGB32());
     return GestureDetector(
       onTap: _showFullColorPicker,
       child: Container(
@@ -270,7 +270,7 @@ class DrawingCanvasState extends State<DrawingCanvas> {
                         decoration: BoxDecoration(border: Border.all(color: Colors.black12), borderRadius: BorderRadius.circular(8)),
                         child: Row(
                           children: [
-                            Text('#${hsvColor.toColor().value.toRadixString(16).substring(2).toUpperCase()}', style: const TextStyle(color: Colors.black87, fontSize: 13, fontWeight: FontWeight.bold)),
+                            Text('#${hsvColor.toColor().toARGB32().toRadixString(16).substring(2).toUpperCase()}', style: const TextStyle(color: Colors.black87, fontSize: 13, fontWeight: FontWeight.bold)),
                             const Spacer(),
                             const Icon(Icons.copy, size: 14, color: Colors.black38),
                           ],
@@ -293,17 +293,17 @@ class DrawingCanvasState extends State<DrawingCanvas> {
                 const SizedBox(height: 20),
                 const Divider(height: 1),
                 const SizedBox(height: 12),
-                _rgbSlider('R', hsvColor.toColor().red, Colors.red, (v) {
+                _rgbSlider('R', (hsvColor.toColor().r * 255).toInt(), Colors.red, (v) {
                   final c = hsvColor.toColor();
-                  setDialogState(() => hsvColor = HSVColor.fromColor(Color.fromARGB(255, v.toInt(), c.green, c.blue)));
+                  setDialogState(() => hsvColor = HSVColor.fromColor(Color.fromARGB(255, v.toInt(), (c.g * 255).toInt(), (c.b * 255).toInt())));
                 }),
-                _rgbSlider('G', hsvColor.toColor().green, Colors.green, (v) {
+                _rgbSlider('G', (hsvColor.toColor().g * 255).toInt(), Colors.green, (v) {
                   final c = hsvColor.toColor();
-                  setDialogState(() => hsvColor = HSVColor.fromColor(Color.fromARGB(255, c.red, v.toInt(), c.blue)));
+                  setDialogState(() => hsvColor = HSVColor.fromColor(Color.fromARGB(255, (c.r * 255).toInt(), v.toInt(), (c.b * 255).toInt())));
                 }),
-                _rgbSlider('B', hsvColor.toColor().blue, Colors.blue, (v) {
+                _rgbSlider('B', (hsvColor.toColor().b * 255).toInt(), Colors.blue, (v) {
                   final c = hsvColor.toColor();
-                  setDialogState(() => hsvColor = HSVColor.fromColor(Color.fromARGB(255, c.red, c.green, v.toInt())));
+                  setDialogState(() => hsvColor = HSVColor.fromColor(Color.fromARGB(255, (c.r * 255).toInt(), (c.g * 255).toInt(), v.toInt())));
                 }),
               ],
             ),
@@ -417,8 +417,11 @@ class MyPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     for (int i = 0; i < pointsList.length - 1; i++) {
-      if (pointsList[i] != null && pointsList[i + 1] != null) canvas.drawLine(pointsList[i]!.offset, pointsList[i + 1]!.offset, pointsList[i]!.paint);
-      else if (pointsList[i] != null && pointsList[i + 1] == null) canvas.drawPoints(ui.PointMode.points, [pointsList[i]!.offset], pointsList[i]!.paint);
+      if (pointsList[i] != null && pointsList[i + 1] != null) {
+        canvas.drawLine(pointsList[i]!.offset, pointsList[i + 1]!.offset, pointsList[i]!.paint);
+      } else if (pointsList[i] != null && pointsList[i + 1] == null) {
+        canvas.drawPoints(ui.PointMode.points, [pointsList[i]!.offset], pointsList[i]!.paint);
+      }
     }
     if (templateDrawer != null) templateDrawer!(canvas, size);
   }

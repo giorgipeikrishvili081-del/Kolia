@@ -5,6 +5,7 @@ import 'package:kolia/services/auth_service.dart';
 import 'package:kolia/services/firebase_service.dart';
 import 'package:kolia/screens/drafts_page.dart';
 import 'package:kolia/screens/plant_id_page.dart';
+import 'package:kolia/screens/map_management_page.dart';
 import 'package:kolia/services/app_state.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -77,37 +78,22 @@ class _HomeScreenState extends State<HomeScreen> {
                 title: ValueListenableBuilder<String>(
                   valueListenable: teamNameNotifier,
                   builder: (context, teamName, _) {
-                    return Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'სამუშაო სივრცე',
+                    return ValueListenableBuilder<Color>(
+                      valueListenable: teamColorNotifier,
+                      builder: (context, teamColor, _) {
+                        return Text(
+                          teamName.isNotEmpty ? teamName : 'გუნდი',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
-                            color: Theme.of(context).colorScheme.onSurface,
-                            fontWeight: FontWeight.w800,
-                            fontSize: 18,
+                            color: teamName.isNotEmpty 
+                                ? teamColor 
+                                : Theme.of(context).colorScheme.onSurface,
+                            fontWeight: FontWeight.w900,
+                            fontSize: 24,
                           ),
-                        ),
-                        if (teamName.isNotEmpty)
-                          ValueListenableBuilder<Color>(
-                            valueListenable: teamColorNotifier,
-                            builder: (context, teamColor, _) {
-                              return Text(
-                                teamName,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  color: teamColor,
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 10,
-                                ),
-                              );
-                            },
-                          ),
-                      ],
+                        );
+                      },
                     );
                   },
                 ),
@@ -232,6 +218,14 @@ class _HomeScreenState extends State<HomeScreen> {
                   childAspectRatio: 2.2,
                 ),
                 delegate: SliverChildListDelegate([
+                  _buildToolTile(
+                    title: 'რუკები',
+                    icon: Icons.map_rounded,
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (context) => const MapManagementPage()),
+                    ),
+                  ),
                   _buildToolTile(
                     title: 'მცენარის ID',
                     icon: Icons.filter_center_focus_rounded,

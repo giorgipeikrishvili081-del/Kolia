@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:kolia/services/auth_service.dart';
 import 'package:kolia/services/firebase_service.dart';
 import 'package:kolia/services/google_drive_service.dart';
-import 'package:kolia/services/form_data_store.dart';
+import 'package:kolia/services/file_export_service.dart';
 import 'package:kolia/services/database_helper.dart';
 import 'package:kolia/screens/btk_form_page.dart';
 
@@ -26,8 +28,19 @@ class _ExportPageState extends State<ExportPage> {
   }
 
   Future<void> _loadInitialData() async {
+    // 1. Get local data first and show it immediately
     final team = await AuthService.getLoggedInTeam();
-    final local = await FormDataStore.savedForms;
+    final local = await DatabaseHelper.instance.getAllForms();
+    
+    if (mounted) {
+      setState(() {
+        _currentTeam = team;
+        _localForms = local;
+      });
+    }
+
+    // 2. Fetch team customizations (might take time if offline)
+    // AuthService.getTeamsWithCustomizations already uses Firestore cache
     final allTeamsList = await AuthService.getTeamsWithCustomizations();
     
     final Map<String, TeamInfo> tMap = {};
@@ -37,8 +50,6 @@ class _ExportPageState extends State<ExportPage> {
 
     if (mounted) {
       setState(() {
-        _currentTeam = team;
-        _localForms = local;
         _teamsMap = tMap;
       });
     }
@@ -48,22 +59,10 @@ class _ExportPageState extends State<ExportPage> {
     setState(() => _isSyncing = true);
     try {
       final dbId = form['db_id'];
-      
-      // Get the full data from local DB to ensure we have everything
       final fullLocalData = await DatabaseHelper.instance.getForm(dbId);
       if (fullLocalData == null) throw Exception("ლოკალური მონაცემები ვერ მოიძებნა");
 
-      // Extract form data (usually under 'data' key for BtkFormPage)
-      Map<String, dynamic> dataToSync;
-      if (fullLocalData['data'] != null && fullLocalData['data'] is Map) {
-        dataToSync = Map<String, dynamic>.from(fullLocalData['data']);
-      } else {
-        dataToSync = Map<String, dynamic>.from(fullLocalData);
-        dataToSync.remove('db_id');
-        dataToSync.remove('is_synced');
-        dataToSync.remove('is_uploaded');
-        dataToSync.remove('data');
-      }
+      final dataToSync = DatabaseHelper.extractFormData(fullLocalData);
       
       await FirebaseService.saveForm(dataToSync, localDbId: dbId);
       await _loadInitialData();
@@ -83,18 +82,119 @@ class _ExportPageState extends State<ExportPage> {
     }
   }
 
-  Future<void> _uploadAllToDrive(List<Map<String, dynamic>> allForms) async {
-    final toUpload = allForms.where((f) => f['source'] == 'cloud' && f['is_uploaded'] != true).toList();
+  Future<void> _uploadTodaysToDrive(List<Map<String, dynamic>> allForms) async {
+    final now = DateTime.now();
+    final todayStr = "${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}";
+    final todayStrDot = "${now.day.toString().padLeft(2, '0')}.${now.month.toString().padLeft(2, '0')}.${now.year}";
     
-    if (toUpload.isEmpty) {
+    debugPrint('ExportPage: Searching for forms with date: $todayStr or $todayStrDot');
+    
+    final todaysForms = allForms.where((f) {
+      final rawDate = f['date'] ?? f['თარიღი'];
+      if (rawDate == null) {
+        debugPrint('ExportPage: Form ${f['btk_index'] ?? f['ბტკ ინდექსი'] ?? 'unknown'} has no date field');
+        return false;
+      }
+
+      DateTime? formDate;
+      if (rawDate is Timestamp) {
+        formDate = rawDate.toDate();
+      } else if (rawDate is DateTime) {
+        formDate = rawDate;
+      } else {
+        final formDateStr = rawDate.toString().trim();
+        debugPrint('ExportPage: Checking form ${f['btk_index'] ?? 'unknown'} with date string "$formDateStr"');
+        
+        if (formDateStr.startsWith(todayStr) || formDateStr.startsWith(todayStrDot)) return true;
+        
+        // Fallback 1: try parsing to DateTime
+        try {
+          formDate = DateTime.parse(formDateStr);
+        } catch (_) {
+          // Fallback 2: Handle DD.MM.YYYY or DD/MM/YYYY formats
+          try {
+            final parts = formDateStr.split(RegExp(r'[./-]'));
+            if (parts.length >= 3) {
+              int? d, m, y;
+              if (parts[0].length == 4) { // YYYY.MM.DD
+                y = int.tryParse(parts[0]);
+                m = int.tryParse(parts[1]);
+                d = int.tryParse(parts[2]);
+              } else { // DD.MM.YYYY
+                d = int.tryParse(parts[0]);
+                m = int.tryParse(parts[1]);
+                y = int.tryParse(parts[2]);
+              }
+              
+              if (d != null && m != null && y != null) {
+                formDate = DateTime(y, m, d);
+              }
+            }
+          } catch (_) {}
+        }
+      }
+
+      if (formDate != null) {
+        return formDate.year == now.year && 
+               formDate.month == now.month && 
+               formDate.day == now.day;
+      }
+
+      return false;
+    }).toList();
+
+    if (todaysForms.isEmpty) {
+      debugPrint('ExportPage: No forms found for today ($todayStr). Total forms checked: ${allForms.length}');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('ასატვირთი ფორმები არ მოიძებნა')),
+          SnackBar(content: Text('დღევანდელი ბლანკები ვერ მოიძებნა ($todayStr)')),
         );
       }
       return;
     }
 
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('დღევანდელი ბლანკები'),
+        content: Text('ნამდვილად გსურთ დღევანდელი ${todaysForms.length} ბლანკის ატვირთვა Google Drive-ზე?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('გაუქმება')),
+          TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('ატვირთვა')),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      await _uploadToDriveInternal(todaysForms);
+    }
+  }
+
+  Future<void> _uploadAllToDrive(List<Map<String, dynamic>> allForms) async {
+    // Include all forms that are not uploaded yet, regardless of source (local or cloud)
+    final toUpload = allForms.where((f) => f['is_uploaded'] != true).toList();
+    
+    if (toUpload.isEmpty) {
+      final confirm = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Drive-ზე ატვირთვა'),
+          content: const Text('ყველა ბლანკი უკვე ატვირთულია Google Drive-ზე. გსურთ მათი თავიდან ატვირთვა?'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('არა')),
+            TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('დიახ')),
+          ],
+        ),
+      );
+      if (!mounted) return;
+      if (confirm != true) return;
+      toUpload.addAll(allForms);
+    }
+
+    await _uploadToDriveInternal(toUpload);
+  }
+
+  Future<void> _uploadToDriveInternal(List<Map<String, dynamic>> toUpload) async {
     int successCount = 0;
     int failCount = 0;
 
@@ -127,29 +227,36 @@ class _ExportPageState extends State<ExportPage> {
       ),
     );
 
-    for (int i = 0; i < toUpload.length; i++) {
-      final form = toUpload[i];
-      final btkIndex = form['btk_index'] ?? 'Unknown';
-      statusNotifier.value = 'იტვირთება: $btkIndex\n(${i + 1} / ${toUpload.length})';
-      
+    final String? uploadFolderId = await FirebaseService.getUploadFolderId();
+
+    // Perform uploads in parallel for speed
+    final List<Future<void>> uploadTasks = toUpload.map((form) async {
+      final btkIndex = form['btk_index'] ?? form['ბტკ ინდექსი'] ?? 'Unknown';
       try {
-        await GoogleDriveService.uploadFormAsGoogleDoc(form);
+        await GoogleDriveService.uploadFormAsGoogleDoc(form, parentFolderId: uploadFolderId);
         successCount++;
       } catch (e) {
+        debugPrint('Drive upload error for $btkIndex: $e');
         failCount++;
       }
-      progressNotifier.value = (i + 1) / toUpload.length;
-    }
+      progressNotifier.value = (successCount + failCount) / toUpload.length;
+      statusNotifier.value = 'დასრულდა: $btkIndex\n(${successCount + failCount} / ${toUpload.length})';
+    }).toList();
+
+    await Future.wait(uploadTasks);
     
     if (mounted) {
       Navigator.pop(context); // Close progress dialog
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('$successCount ბლანკი წარმატებით აიტვირთა. ${failCount > 0 ? "$failCount ჩაიშალა." : ""}'), 
-          backgroundColor: failCount > 0 ? Colors.orange : Colors.green,
-          duration: const Duration(seconds: 4),
-        ),
-      );
+      await _loadInitialData(); // Refresh UI to reflect upload status
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('$successCount ბლანკი წარმატებით აიტვირთა. ${failCount > 0 ? "$failCount ჩაიშალა." : ""}'), 
+            backgroundColor: failCount > 0 ? Colors.orange : Colors.green,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
     }
   }
 
@@ -160,54 +267,56 @@ class _ExportPageState extends State<ExportPage> {
       final generalStats = await FirebaseService.getGeneralStats();
       if (!mounted) return;
       
-      final int totalToday = todayStats.values.fold(0, (sum, val) => sum + val);
-      final int totalGeneral = generalStats.values.fold(0, (sum, val) => sum + val);
+      final int totalToday = todayStats.values.fold(0, (acc, val) => acc + val);
+      final int totalGeneral = generalStats.values.fold(0, (acc, val) => acc + val);
 
-      showDialog(
-        context: context,
-        builder: (context) {
-          final isDark = Theme.of(context).brightness == Brightness.dark;
-          return DefaultTabController(
-            length: 2,
-            child: AlertDialog(
-              titlePadding: EdgeInsets.zero,
-              title: Column(
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(24, 24, 24, 8),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.analytics_outlined, color: Colors.teal),
-                        const SizedBox(width: 12),
-                        const Text('სტატისტიკა'),
+      if (mounted) {
+        showDialog(
+          context: context,
+          builder: (context) {
+            final isDark = Theme.of(context).brightness == Brightness.dark;
+            return DefaultTabController(
+              length: 2,
+              child: AlertDialog(
+                titlePadding: EdgeInsets.zero,
+                title: Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(24, 24, 24, 8),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.analytics_outlined, color: Colors.teal),
+                          const SizedBox(width: 12),
+                          const Text('სტატისტიკა'),
+                        ],
+                      ),
+                    ),
+                    const TabBar(
+                      tabs: [
+                        Tab(text: 'დღეს'),
+                        Tab(text: 'ჯამური'),
                       ],
                     ),
-                  ),
-                  const TabBar(
-                    tabs: [
-                      Tab(text: 'დღეს'),
-                      Tab(text: 'ჯამური'),
-                    ],
-                  ),
-                ],
-              ),
-              content: SizedBox(
-                width: double.maxFinite,
-                height: 350,
-                child: TabBarView(
-                  children: [
-                    _buildStatsList(todayStats, totalToday, 'დღევანდელი ბლანკები', isDark),
-                    _buildStatsList(generalStats, totalGeneral, 'ჯამური ბლანკები', isDark),
                   ],
                 ),
+                content: SizedBox(
+                  width: double.maxFinite,
+                  height: 350,
+                  child: TabBarView(
+                    children: [
+                      _buildStatsList(todayStats, totalToday, 'დღევანდელი ბლანკები', isDark),
+                      _buildStatsList(generalStats, totalGeneral, 'ჯამური ბლანკები', isDark),
+                    ],
+                  ),
+                ),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(context), child: const Text('დახურვა')),
+                ],
               ),
-              actions: [
-                TextButton(onPressed: () => Navigator.pop(context), child: const Text('დახურვა')),
-              ],
-            ),
-          );
-        },
-      );
+            );
+          },
+        );
+      }
     } catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('შეცდომა: $e')));
     } finally {
@@ -307,7 +416,7 @@ class _ExportPageState extends State<ExportPage> {
       setState(() => _isSyncing = true);
       try {
         await FirebaseService.deleteAllForms();
-        await FormDataStore.clearAllLocalForms();
+        await DatabaseHelper.instance.clearAllData();
         await _loadInitialData();
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -327,6 +436,16 @@ class _ExportPageState extends State<ExportPage> {
   }
 
   Future<void> _syncAllLocal() async {
+    final connectivityResult = await Connectivity().checkConnectivity();
+    if (connectivityResult.contains(ConnectivityResult.none)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('სინქრონიზაციისთვის საჭიროა ინტერნეტთან კავშირი'), backgroundColor: Colors.orange),
+        );
+      }
+      return;
+    }
+
     setState(() => _isSyncing = true);
     try {
       final count = await FirebaseService.syncAllUnsynced();
@@ -348,6 +467,7 @@ class _ExportPageState extends State<ExportPage> {
   }
 
   void _showSyncOptions(List<Map<String, dynamic>> forms) {
+    final isAdmin = _currentTeam?.isAdmin ?? false;
     showModalBottomSheet(
       context: context,
       shape: const RoundedRectangleBorder(
@@ -373,18 +493,74 @@ class _ExportPageState extends State<ExportPage> {
               },
             ),
             ListTile(
-              leading: const Icon(Icons.add_to_drive_outlined, color: Colors.blue),
-              title: const Text('Sync all to Drive'),
+              leading: const Icon(Icons.table_chart_rounded, color: Colors.green),
+              title: const Text('Bulk Export to CSV'),
+              subtitle: const Text('ყველა ბლანკის ექსპორტი ერთ ფაილად'),
+              onTap: () {
+                Navigator.pop(context);
+                _bulkExportCsv(forms);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.today_outlined, color: Colors.blue),
+              title: const Text('Upload Today\'s to Drive'),
+              subtitle: const Text('მხოლოდ დღევანდელი ბლანკების ატვირთვა'),
+              onTap: () {
+                Navigator.pop(context);
+                _uploadTodaysToDrive(forms);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.add_to_drive_outlined, color: Colors.blueGrey),
+              title: const Text('Upload All to Drive'),
               subtitle: const Text('ყველა ბლანკის ატვირთვა Google Drive-ზე'),
               onTap: () {
                 Navigator.pop(context);
                 _uploadAllToDrive(forms);
               },
             ),
+            if (isAdmin)
+              ListTile(
+                leading: const Icon(Icons.calendar_today_rounded, color: Colors.purple),
+                title: const Text('Update All to Today'),
+                subtitle: const Text('ყველა ბლანკის თარიღის განახლება დღევანდელით'),
+                onTap: () async {
+                  Navigator.pop(context);
+                  final confirm = await showDialog<bool>(
+                    context: context,
+                    builder: (context) => AlertDialog(
+                      title: const Text('თარიღების განახლება'),
+                      content: const Text('ნამდვილად გსურთ ყველა შენახული ბლანკის თარიღის შეცვლა დღევანდელით?'),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('არა')),
+                        TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('დიახ')),
+                      ],
+                    ),
+                  );
+                    if (confirm == true) {
+                      setState(() => _isSyncing = true);
+                      await DatabaseHelper.instance.updateAllDatesToCurrent();
+                      await _loadInitialData();
+                      if (mounted) {
+                        setState(() => _isSyncing = false);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('ყველა ბლანკის თარიღი განახლდა')),
+                        );
+                      }
+                    }
+                },
+              ),
           ],
         ),
       ),
     );
+  }
+
+  Future<void> _handleRefresh() async {
+    // Attempt to sync pending forms first when user pulls to refresh
+    await FirebaseService.syncAllUnsynced();
+    // Then reload local state
+    await _loadInitialData();
   }
 
   @override
@@ -417,22 +593,53 @@ class _ExportPageState extends State<ExportPage> {
         // 2. Process local forms and merge/replace duplicates
         for (var f in _localForms) {
           final dbId = f['db_id'];
-          final cloudIdInLocal = f['id']; // This might exist if it was previously synced
+          final String? cloudIdInLocal = f['id'] ?? (f['data'] is Map ? f['data']['id'] : null);
+          final String? btkIndex = f['btk_index'] ?? f['ბტკ ინდექსი'] ?? (f['data'] is Map ? (f['data']['btk_index'] ?? f['data']['ბტკ ინდექსი']) : null);
+          final String? teamId = f['team_id'] ?? (f['data'] is Map ? f['data']['team_id'] : null);
           
           final Map<String, dynamic> localFormProcessed = {
-            ...(f['data'] is Map ? f['data'] : f),
+            ...f,
+            if (f['data'] is Map) ...f['data'],
             'db_id': dbId,
             'source': 'local',
             'is_synced': f['is_synced'] == true,
           };
 
+          // Try to find a matching cloud form by ID or by Index/Team fallback
+          String? matchId;
           if (cloudIdInLocal != null && combinedMap.containsKey(cloudIdInLocal)) {
-            // Already in cloud, update the cloud entry with local DB ID for easier management
-            combinedMap[cloudIdInLocal]!['db_id'] = dbId;
-          } else {
-            // Not in cloud yet (or at least not identified by ID)
-            combinedMap['local_$dbId'] = localFormProcessed;
+            matchId = cloudIdInLocal;
+          } else if (btkIndex != null && btkIndex.isNotEmpty) {
+            matchId = combinedMap.keys.firstWhere(
+              (k) => (combinedMap[k]!['btk_index'] == btkIndex || combinedMap[k]!['ბტკ ინდექსი'] == btkIndex) && 
+                     combinedMap[k]!['team_id'] == teamId,
+              orElse: () => '',
+            );
+            if (matchId == '') matchId = null;
           }
+
+          if (matchId != null) {
+            // Already in cloud, update the cloud entry with local DB ID
+            combinedMap[matchId]!['db_id'] = dbId;
+            // Merge local data into cloud data to ensure we have all fields (like db_id)
+            combinedMap[matchId] = {
+              ...localFormProcessed,
+              ...combinedMap[matchId]!,
+              'db_id': dbId, // Priority to local DB ID
+            };
+            continue;
+          }
+
+          // If it was synced but is gone from cloud (deleted by supervisor), skip it
+          // However, we should be careful here. If it's missing from combinedMap 
+          // but was marked as synced, it might be due to Firestore lag/pending writes.
+          // We'll show it anyway if it was marked as synced but not found in cloud map.
+          // if (cloudIdInLocal != null && f['is_synced'] == true) {
+          //   continue;
+          // }
+
+          // Not in cloud yet
+          combinedMap['local_$dbId'] = localFormProcessed;
         }
 
         final isAdmin = _currentTeam?.isAdmin ?? false;
@@ -467,6 +674,11 @@ class _ExportPageState extends State<ExportPage> {
                   ),
                 if (isAdmin) ...[
                   IconButton(
+                    icon: const Icon(Icons.cloud_upload_rounded, color: Colors.blueAccent),
+                    onPressed: () => _uploadTodaysToDrive(forms),
+                    tooltip: 'დღევანდელი ბლანკების ატვირთვა Drive-ზე',
+                  ),
+                  IconButton(
                     icon: const Icon(Icons.bar_chart_rounded, color: Colors.teal),
                     onPressed: _showStats,
                     tooltip: 'დღევანდელი სტატისტიკა',
@@ -482,7 +694,7 @@ class _ExportPageState extends State<ExportPage> {
           ),
           body: forms.isEmpty 
             ? RefreshIndicator(
-                onRefresh: _loadInitialData,
+                onRefresh: _handleRefresh,
                 child: ListView(
                   children: [
                     SizedBox(height: MediaQuery.of(context).size.height * 0.3),
@@ -500,7 +712,7 @@ class _ExportPageState extends State<ExportPage> {
                 ),
               )
             : RefreshIndicator(
-                onRefresh: _loadInitialData,
+                onRefresh: _handleRefresh,
                 child: ListView.builder(
                 padding: const EdgeInsets.all(16),
                 itemCount: forms.length,
@@ -517,7 +729,8 @@ class _ExportPageState extends State<ExportPage> {
                   final form = {
                     ...rawForm,
                     'team_name': teamName,
-                    if (customizedColor != null) 'team_color': customizedColor.value,
+                    if (customizedColor != null) 'team_name': teamName, // Redundant but safe
+                    if (customizedColor != null) 'team_color': customizedColor.toARGB32(),
                   };
 
                   final baseTeamForCurrent = _currentTeam != null 
@@ -625,7 +838,7 @@ class _ExportPageState extends State<ExportPage> {
                                 ),
                               ),
                             ).then((_) => _loadInitialData()),
-                            icon: Icon(canEdit ? Icons.edit_rounded : Icons.remove_red_eye_rounded, 
+                            icon: Icon(canEdit ? Icons.edit_rounded : Icons.remove_red_eye_rounded,
                               color: canEdit ? Colors.orange : Colors.blueGrey),
                           ),
                           PopupMenuButton<String>(
@@ -633,6 +846,7 @@ class _ExportPageState extends State<ExportPage> {
                             onSelected: (val) {
                               if (val == 'sync') _syncSingleForm(form);
                               if (val == 'pdf') _savePdf(form);
+                              if (val == 'csv') _saveCsv(form);
                               if (val == 'drive') _uploadToDrive(form);
                               if (val == 'delete') _deleteForm(form);
                             },
@@ -655,6 +869,16 @@ class _ExportPageState extends State<ExportPage> {
                                     Icon(Icons.picture_as_pdf_rounded, color: Colors.red, size: 20),
                                     SizedBox(width: 12),
                                     Text('ჩამოტვირთვა (PDF)'),
+                                  ],
+                                ),
+                              ),
+                              const PopupMenuItem(
+                                value: 'csv',
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.table_chart_rounded, color: Colors.green, size: 20),
+                                    SizedBox(width: 12),
+                                    Text('ჩამოტვირთვა (CSV/Excel)'),
                                   ],
                                 ),
                               ),
@@ -699,10 +923,12 @@ class _ExportPageState extends State<ExportPage> {
   }
 
   void _deleteForm(Map<String, dynamic> form) async {
-    final bool isCloud = form['source'] == 'cloud';
-    final String title = isCloud ? 'ბლანკის წაშლა Cloud-იდან' : 'ბლანკის წაშლა';
-    final String content = isCloud 
-      ? 'ნამდვილად გსურთ ბლანკის "${form['btk_index']}" წაშლა Cloud-იდან? ეს მოქმედება შეუქცევადია.'
+    final String? cloudId = form['id'];
+    final int? dbId = form['db_id'];
+
+    final String title = cloudId != null ? 'ბლანკის წაშლა Cloud-იდან' : 'ბლანკის წაშლა';
+    final String content = cloudId != null 
+      ? 'ნამდვილად გსურთ ბლანკის "${form['btk_index']}" წაშლა ყველგან? ეს მოქმედება შეუქცევადია.'
       : 'ნამდვილად გსურთ ბლანკის "${form['btk_index']}" წაშლა ლოკალური მეხსიერებიდან?';
 
     final confirm = await showDialog<bool>(
@@ -723,10 +949,11 @@ class _ExportPageState extends State<ExportPage> {
     if (confirm == true) {
       setState(() => _isSyncing = true);
       try {
-        if (isCloud && form['id'] != null) {
-          await FirebaseService.deleteForm(form['id']);
-        } else if (form['db_id'] != null) {
-          await FormDataStore.deleteForm(form['db_id']);
+        if (cloudId != null) {
+          await FirebaseService.deleteForm(cloudId);
+        }
+        if (dbId != null) {
+          await DatabaseHelper.instance.deleteForm(dbId);
         }
         await _loadInitialData();
         if (mounted) {
@@ -744,7 +971,52 @@ class _ExportPageState extends State<ExportPage> {
 
   void _savePdf(Map<String, dynamic> form) async {
     final html = GoogleDriveService.generateHtmlContent(form);
-    await FormDataStore.savePdf(form, html);
+    await FileExportService.savePdf(form, html);
+  }
+
+  void _saveCsv(Map<String, dynamic> form) async {
+    try {
+      final path = await FileExportService.saveCSVToFile(form);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('CSV შენახულია: $path'),
+            backgroundColor: Colors.green,
+            action: SnackBarAction(label: 'OK', textColor: Colors.white, onPressed: () {}),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('CSV შეცდომა: $e'), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  void _bulkExportCsv(List<Map<String, dynamic>> forms) async {
+    setState(() => _isSyncing = true);
+    try {
+      final path = await FileExportService.saveAllToCSV(forms);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('ექსპორტი დასრულდა: $path'),
+            backgroundColor: Colors.green,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('ექსპორტის შეცდომა: $e'), backgroundColor: Colors.red),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isSyncing = false);
+    }
   }
 
   void _uploadToDrive(Map<String, dynamic> form) async {
@@ -774,7 +1046,8 @@ class _ExportPageState extends State<ExportPage> {
         ),
       );
       
-      await GoogleDriveService.uploadFormAsGoogleDoc(form);
+      final String? uploadFolderId = await FirebaseService.getUploadFolderId();
+      await GoogleDriveService.uploadFormAsGoogleDoc(form, parentFolderId: uploadFolderId);
       
       if (mounted) {
         Navigator.pop(context); // Close progress dialog

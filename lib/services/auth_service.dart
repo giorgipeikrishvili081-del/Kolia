@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:kolia/services/secrets.dart';
+import 'package:kolia/services/firebase_service.dart';
 
 class TeamInfo {
   final String id;
@@ -83,12 +84,40 @@ class AuthService {
     if (teamId == null) return;
 
     if (name != null) await prefs.setString('${_customNameKey}_$teamId', name);
-    if (color != null) await prefs.setInt('${_customColorKey}_$teamId', color.value);
+    if (color != null) await prefs.setInt('${_customColorKey}_$teamId', color.toARGB32());
+
+    // Sync to Firebase so other devices see the change
+    try {
+      final currentTeam = await getLoggedInTeam();
+      if (currentTeam != null) {
+        await FirebaseService.updateTeamCustomization(
+          teamId,
+          currentTeam.name,
+          currentTeam.color.toARGB32(),
+        );
+      }
+    } catch (e) {
+      debugPrint('Firebase team sync failed: $e');
+    }
   }
 
   static Future<List<TeamInfo>> getTeamsWithCustomizations() async {
+    // 1. Fetch latest customizations from Firebase first
+    try {
+      final remoteCustoms = await FirebaseService.getTeamCustomizations();
+      final prefs = await SharedPreferences.getInstance();
+      for (var entry in remoteCustoms.entries) {
+        final tId = entry.key;
+        final data = entry.value;
+        if (data['name'] != null) await prefs.setString('${_customNameKey}_$tId', data['name']);
+        if (data['color'] != null) await prefs.setInt('${_customColorKey}_$tId', data['color']);
+      }
+    } catch (e) {
+      debugPrint('Failed to fetch remote team customizations: $e');
+    }
+
     final prefs = await SharedPreferences.getInstance();
-    await prefs.reload(); // Force refresh from disk
+    await prefs.reload();
     return teams.map((baseTeam) {
       final customName = prefs.getString('${_customNameKey}_${baseTeam.id}');
       final customColorValue = prefs.getInt('${_customColorKey}_${baseTeam.id}');
