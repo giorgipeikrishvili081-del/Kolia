@@ -1,9 +1,9 @@
-# Kolia - Field Research & BTK Management
+# Kolia - Field Research & Landscape Management
 
 An advanced Android application for ecological field research, vegetation analysis, and soil classification.
 
 ## Features
-- **BTK Forms**: Comprehensive digital forms for field observations.
+- **Landscape Forms**: Comprehensive digital forms for field observations.
 - **Offline First**: Full SQLite integration for data collection without internet.
 - **Map Integration**: Pinpoint research locations with precision.
 - **Plant Identification**: Automated ID tool for researchers using Pl@ntNet API.
