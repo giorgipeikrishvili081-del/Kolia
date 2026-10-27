@@ -1,4 +1,4 @@
-<p align="center">
+<p align="left">
   <img src="assets/icon/app_icon.png" width="160" alt="Kolia Logo">
 </p>
 
@@ -10,7 +10,7 @@
 
 <a name="english"></a>
 
-## 🌍 Overview (English)
+## Overview (English)
 
 Kolia was born out of a simple observation: field research is messy, remote, and often completely disconnected from the digital world. I built this app to be the bridge between a muddy site and a professional report.
 
@@ -18,7 +18,7 @@ Most research tools are either too generic or too fragile for the field. Kolia i
 
 ---
 
-## 🚀 Key Abilities
+## Key Abilities
 
 ### The Offline-First Engine
 The heart of Kolia is its resilience. I've built it so researchers can record complex observations, classify soil, and pin locations to a map without any cellular connection. Everything is secured in a local **SQLite** vault and automatically synchronized to **Firebase** the moment you're back in range.
@@ -31,7 +31,7 @@ Integrated with the **Pl@ntNet API**, the app acts as a research assistant. Snap
 
 ---
 
-## 🏗 Project Architecture
+## Project Architecture
 
 I've structured the codebase to separate concerns, making it easier to maintain and scale:
 
@@ -56,7 +56,7 @@ lib/
 
 ---
 
-## 📥 Downloads & Deployment
+## Downloads & Deployment
 
 ### Get the Latest Build
 You can download the latest stable version of the app directly from the GitHub Releases page:
@@ -81,7 +81,7 @@ You can download the latest stable version of the app directly from the GitHub R
 
 ---
 
-## 🏗 პროექტის არქიტექტურა
+## პროექტის არქიტექტურა
 
 კოდის სტრუქტურა დაყოფილია მოდულებად, რაც აადვილებს მის მართვას:
 
