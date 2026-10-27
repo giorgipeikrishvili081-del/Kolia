@@ -98,4 +98,4 @@ This project is currently **Proprietary**. All rights are reserved by the develo
 ---
 *Built with ❤️ for researchers who get their boots dirty.*
 
-**Note: Project is heavily vibe coded"**
+**Note: Project is heavily vibe coded**
