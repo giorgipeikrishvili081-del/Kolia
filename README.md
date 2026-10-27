@@ -91,7 +91,7 @@ Kolia შეიქმნა მარტივი დაკვირვები
 
 ---
 
-## 🔐 License & Legal
+## License & Legal
 
 This project is currently **Proprietary**. All rights are reserved by the developer.
 
